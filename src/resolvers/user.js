@@ -1191,7 +1191,7 @@ const verifyUserOTP = async (req, res) => {
       return res.status(400).send({ error: "Phone number already verified" });
     }
     const otp = await verifyOTP({ pin_id, pin });
-    console.log("otp", otp);
+   
     if (otp?.status === "200") {
       const updatedUser = await UserModel.findByIdAndUpdate(
         user?._id,

@@ -322,7 +322,7 @@ const createPromo = async (req, res) => {
     }
     if (req?.files) {
       Object.values(req.files).map(async (file) => {
-        console.log("here 3", file);
+        
         await deleteLocalImagesByFileName(file[0].filename);
       });
     }
@@ -532,7 +532,7 @@ const updatePromo = async (req, res) => {
     if (!promoId) {
       if (req?.files) {
         Object.values(req.files).map(async (file) => {
-          console.log("here 3", file);
+       
           await deleteLocalImagesByFileName(file[0].filename);
         });
       }
@@ -644,7 +644,7 @@ const updatePromo = async (req, res) => {
   } catch (error) {
     if (req?.files) {
       Object.values(req.files).map(async (file) => {
-        console.log("here 3", file);
+       
         await deleteLocalImagesByFileName(file[0].filename);
       });
     }

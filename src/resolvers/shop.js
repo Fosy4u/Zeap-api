@@ -307,7 +307,7 @@ const absoluteDeleteShop = async (req, res) => {
 const deleteShop = async (req, res) => {
   try {
     const { shopId } = req.body;
-    console.log(req.body);
+   
     if (!shopId) {
       return res.status(400).send({ error: "shopId is required" });
     }
