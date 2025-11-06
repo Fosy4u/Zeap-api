@@ -49,7 +49,7 @@ const createDeliveryAddress = async (req, res) => {
     const userDeliveryAddresses = await DeliveryAddressModel.find({
       user: authUser._id,
     });
-    console.log("userDeliveryAddresses", userDeliveryAddresses);
+   
     // check if user already has default address
     if (isDefault) {
       const defaultAddress = userDeliveryAddresses.find(

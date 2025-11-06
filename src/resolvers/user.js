@@ -799,20 +799,6 @@ const getUsers = async (req, res) => {
       .limit(limit)
       .lean();
 
-  
-   // remove all shopId from users
-   // disable shopEnabled
-    const updatedUsers = await Promise.all(
-      users.map(async (user) => {
-    
-        await UserModel.findByIdAndUpdate(user._id, {
-          shopId: null,
-          shopEnabled: false,
-        });
-        return user;
-      })
-    );
-
     return res.status(200).send({ data: users });
   } catch (error) {
     return res.status(500).send({ error: error.message });
@@ -1168,7 +1154,7 @@ const sendOTPToUser = async (req, res) => {
     }
 
     const otp = await sendOTP({ to: phoneNumber, firstName: user.firstName });
-    console.log("otp", otp);
+  
     if (otp?.status === "200") {
       return res
         .status(200)
