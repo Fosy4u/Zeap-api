@@ -1767,13 +1767,17 @@ const getMostPopular = async (req, res) => {
   }
 };
 
+// Helper to safely parse integer query params
+const parseIntQuery = (value, defaultValue = null) => {
+  const parsed = parseInt(value);
+  return isNaN(parsed) ? defaultValue : parsed;
+};
+
 const searchProducts = async (req, res) => {
   try {
     const { search } = req.query;
+    if (!search) return res.status(400).send({ error: "search is required" });
 
-    if (!search) {
-      return res.status(400).send({ error: "search is required" });
-    }
     const query = getQuery(req.query);
 
     const aggregate = [
@@ -1782,91 +1786,56 @@ const searchProducts = async (req, res) => {
           index: "products",
           text: {
             query: search,
-            path: {
-              wildcard: "*",
-            },
+            path: { wildcard: "*" },
           },
         },
       },
-      {
-        $match: { ...query },
-      },
-
-      {
-        $sort: { score: { $meta: "textScore" } },
-      },
+      { $match: { ...query } },
+      { $addFields: { score: { $meta: "searchScore" } } },
+      { $sort: { score: -1 } },
     ];
+
     const products = await ProductModel.aggregate(aggregate).exec();
     const dynamicFilters = getDynamicFilters(products);
 
-    const data = {
-      products,
-      dynamicFilters,
-    };
-    return res.status(200).send({ data: data });
+    return res.status(200).send({ data: { products, dynamicFilters } });
   } catch (err) {
+    console.error("searchProducts error:", err);
     return res.status(500).send({ error: err.message });
   }
 };
+
 const searchLiveProducts = async (req, res) => {
   try {
     const { search } = req.query;
-    const limit = parseInt(req.query.limit);
-    const pageNumber = parseInt(req.query.pageNumber);
-    if (!limit) {
-      return res.status(400).send({
-        error: "limit is required. This is maximum number you want per page",
-      });
-    }
+    const limit = parseIntQuery(req.query.limit);
+    const pageNumber = parseIntQuery(req.query.pageNumber);
 
-    if (!pageNumber) {
-      return res.status(400).send({
-        error:
-          "pageNumber is required. This is the current page number in the pagination",
-      });
-    }
-    if (!search) {
-      return res.status(400).send({ error: "search is required" });
-    }
+    if (!limit) return res.status(400).send({ error: "limit is required" });
+    if (!pageNumber)
+      return res.status(400).send({ error: "pageNumber is required" });
+    if (!search) return res.status(400).send({ error: "search is required" });
 
     const query = getQuery(req.query);
     query.status = "live";
-    const should = [
-      {
-        text: {
-          query: search,
-          path: {
-            wildcard: "*",
-          },
-        },
-      },
-    ];
 
-    searchQueryAllowedPaths.forEach((p) => {
-      should.push({
-        autocomplete: {
-          query: search,
-          path: p.value,
-        },
-      });
-    });
+    const should = [
+      { text: { query: search, path: { wildcard: "*" } } },
+      ...searchQueryAllowedPaths.map((p) => ({
+        autocomplete: { query: search, path: p.value },
+      })),
+    ];
 
     const aggregate = [
       {
         $search: {
           index: "products",
-          compound: {
-            should,
-            minimumShouldMatch: 1,
-          },
+          compound: { should, minimumShouldMatch: 1 },
         },
       },
-      {
-        $match: { ...query },
-      },
-      {
-        $sort: { score: { $meta: "textScore" } },
-      },
+      { $match: { ...query } },
+      { $addFields: { score: { $meta: "searchScore" } } },
+      { $sort: { score: -1 } },
       {
         $facet: {
           products: [{ $skip: limit * (pageNumber - 1) }, { $limit: limit }],
@@ -1874,123 +1843,90 @@ const searchLiveProducts = async (req, res) => {
         },
       },
     ];
+
     const productsData = await ProductModel.aggregate(aggregate).exec();
     const authUser = await getAuthUser(req);
     const currency = req.query.currency || authUser?.prefferedCurrency || "NGN";
+
     const products = await addPreferredAmountAndCurrency(
       productsData[0].products,
       currency
     );
     const totalCount = productsData[0].allProducts[0]?.count || 0;
     const dynamicFilters = getDynamicFilters(productsData[0].products);
-    const data = {
-      products,
-      totalCount,
-      dynamicFilters,
-    };
-    return res.status(200).send({ data: data });
+
+    return res
+      .status(200)
+      .send({ data: { products, totalCount, dynamicFilters } });
   } catch (err) {
+    console.error("searchLiveProducts error:", err);
     return res.status(500).send({ error: err.message });
   }
 };
+
 const searchSimilarProducts = async (req, res) => {
   try {
     const { productId } = req.query;
-    const limit = parseInt(req.query.limit);
+    const limit = parseIntQuery(req.query.limit);
 
-    if (!limit) {
-      return res.status(400).send({
-        error: "limit is required. This is maximum number you want per page",
-      });
-    }
-    if (!productId) {
+    if (!limit) return res.status(400).send({ error: "limit is required" });
+    if (!productId)
       return res.status(400).send({ error: "productId is required" });
-    }
-    const product = await ProductModel.findOne({ productId }).exec();
-    if (!product) {
-      return res.status(400).send({ error: "product not found" });
-    }
 
-    const styles = product.categories.style;
-    const design = product.categories.design;
-    const occasion = product.categories.occasion;
-    const search = [...styles, ...design, ...occasion].join(" ");
-    const productType = product.productType;
-    const main = product.categories.main;
-    const gender = product.categories.gender;
-    const ageGroup = product.categories.age.ageGroup;
+    const product = await ProductModel.findOne({ productId }).lean();
+    if (!product) return res.status(400).send({ error: "product not found" });
+
+    const searchTerms = [
+      ...(product.categories.style || []),
+      ...(product.categories.design || []),
+      ...(product.categories.occasion || []),
+    ].join(" ");
 
     const queryParam = {
       status: "live",
-      productType,
-      "categories.main": { $in: main },
-      "categories.gender": { $in: gender },
-      "categories.age.ageGroup": ageGroup,
+      productType: product.productType,
+      "categories.main": { $in: product.categories.main },
+      "categories.gender": { $in: product.categories.gender },
+      "categories.age.ageGroup": product.categories.age.ageGroup,
     };
 
     const should = [
-      {
-        text: {
-          query: search,
-          path: {
-            wildcard: "*",
-          },
-        },
-      },
-      {
-        autocomplete: {
-          query: search,
-          path: "title",
-        },
-      },
-      {
-        autocomplete: {
-          query: search,
-          path: "categories.design",
-        },
-      },
-      {
-        autocomplete: {
-          query: search,
-          path: "categories.style",
-        },
-      },
-      {
-        autocomplete: {
-          query: search,
-          path: "categories.occasion",
-        },
-      },
+      { text: { query: searchTerms, path: { wildcard: "*" } } },
+      { autocomplete: { query: searchTerms, path: "title" } },
+      { autocomplete: { query: searchTerms, path: "categories.design" } },
+      { autocomplete: { query: searchTerms, path: "categories.style" } },
+      { autocomplete: { query: searchTerms, path: "categories.occasion" } },
     ];
+
     const aggregate = [
       {
         $search: {
           index: "products",
-          compound: {
-            should,
-            minimumShouldMatch: 1,
-          },
+          compound: { should, minimumShouldMatch: 1 },
         },
       },
-      {
-        $match: { ...queryParam, productId: { $ne: productId } },
-      },
-      {
-        $limit: limit,
-      },
+      { $match: { ...queryParam, productId: { $ne: productId } } },
+      { $addFields: { score: { $meta: "searchScore" } } },
+      { $sort: { score: -1 } },
+      { $limit: limit },
     ];
+
     const products = await ProductModel.aggregate(aggregate).exec();
     const authUser = await getAuthUser(req);
     const currency = req.query.currency || authUser?.prefferedCurrency || "NGN";
+
     const productsData = await addPreferredAmountAndCurrency(
       products,
       currency
     );
+
     return res.status(200).send({ data: productsData });
   } catch (err) {
+    console.error("searchSimilarProducts error:", err);
     return res.status(500).send({ error: err.message });
   }
 };
+
 const getQueryProductsDynamicFilters = async (req, res) => {
   try {
     const query = getQuery(req.query);

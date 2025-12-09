@@ -24,12 +24,13 @@ const UserModel = require("../models/user");
 const Stripe = require("stripe");
 const { allowedDeliveryCountries } = require("../helpers/constants");
 const { update } = require("lodash");
+const { verifyPaystackPayment, verifyPaystack } = require("../helpers/paystack");
+const { verifyStripePayment } = require("../helpers/stripe");
 
 const secretKey =
   ENV === "dev"
     ? process.env.PAYSTACK_SECRET_TEST_KEY
     : process.env.PAYSTACK_SECRET_LIVE_KEY;
-const environment = process.env.NODE_ENV;
 
 const stripeKey =
   ENV === "dev"
@@ -484,21 +485,7 @@ const getReference = async (req, res) => {
   }
 };
 
-const verifyPaystack = (ref, mycallback) => {
-  const options = {
-    url:
-      "https://api.paystack.co/transaction/verify/" + encodeURIComponent(ref),
-    headers: {
-      authorization: `Bearer ${secretKey}`,
-      "content-type": "application/json",
-      "cache-control": "no-cache",
-    },
-  };
-  const callback = (error, response, body) => {
-    return mycallback(error, body);
-  };
-  request(options, callback);
-};
+
 
 const initializePayment = (form, mycallback) => {
   const options = {
@@ -520,149 +507,110 @@ const initializePayment = (form, mycallback) => {
 const verifyPayment = async (req, res) => {
   try {
     const { reference } = req.body;
+
     if (!reference) {
-      return res.status(400).send({ error: "required reference" });
+      return res.status(400).send({ error: "Reference is required" });
     }
 
-    const payment = await PaymentModel.findOne({ reference }).lean();
+    let payment = await PaymentModel.findOne({ reference }).lean();
     if (!payment) {
       return res.status(404).send({
-        error:
-          "Payment not found. Please ensure you have the correct reference",
+        error: "Payment not found. Please ensure the reference is correct",
       });
     }
 
-    const currency = payment.currency || "NGN";
     let updatedPayment = payment;
-    if (payment.status !== "success") {
-      if (currency === "NGN") {
-        verifyPaystack(reference, async (error, body) => {
-          if (error) {
-            reject(error.message);
-          }
-          const response = JSON.parse(body);
-          if (response.status !== true) {
-            return res.status(400).send({
-              error: "Payment not successful",
-            });
-          }
+    const currency = payment.currency || "NGN";
 
-          const {
-            amount,
-            status,
-            paidAt,
-            channel,
-            currency,
-            transaction_date,
-            log,
-            fees,
-            gateway_response,
-            authorization,
-          } = response.data;
-          const { card_type, bank, country_code } = authorization;
+    // ------------------------------------------------------------
+    // PAYSTACK
+    // ------------------------------------------------------------
+    if (payment.status !== "success" && currency === "NGN") {
+      let response;
 
-          updatedPayment = await PaymentModel.findOneAndUpdate(
-            { reference },
-            {
-              amount,
-              status,
-              paidAt,
-              channel,
-              currency,
-              transactionDate: transaction_date,
-              log,
-              fees,
-              cardType: card_type,
-              bank,
-              countryCode: country_code,
-              gatewayResponse: gateway_response,
-              gateway: "paystack",
-            },
-            { new: true }
-          );
-        });
-      } else {
-        // verify stripe payment status
-        const stripePaymentIntentId = payment.stripePaymentIntentId;
-        if (!stripePaymentIntentId) {
-          return res.status(400).send({
-            error: "Payment not successful",
-          });
-        }
-        const paymentIntent = await stripe.paymentIntents.retrieve(
-          stripePaymentIntentId,
-          {
-            expand: ["payment_method", "charges.data.balance_transaction"],
-          }
+      try {
+        response = await verifyPaystackPayment(reference);
+      } catch (err) {
+        return res.status(400).send({ error: err.message });
+      }
+
+      if (!response.status || !response.data) {
+        return res.status(400).send({ error: "Payment not successful" });
+      }
+
+      const data = response.data;
+      const { authorization } = data;
+
+      updatedPayment = await PaymentModel.findOneAndUpdate(
+        { reference },
+        {
+          amount: data.amount,
+          status: data.status,
+          paidAt: data.paidAt,
+          channel: data.channel,
+          currency: data.currency,
+          transactionDate: data.transaction_date,
+          log: data.log,
+          fees: data.fees,
+          cardType: authorization?.card_type,
+          bank: authorization?.bank,
+          countryCode: authorization?.country_code,
+          gatewayResponse: data.gateway_response,
+          gateway: "paystack",
+        },
+        { new: true }
+      ).lean();
+    }
+
+    // ------------------------------------------------------------
+    // STRIPE
+    // ------------------------------------------------------------
+    if (payment.status !== "success" && currency !== "NGN") {
+      try {
+        const { paymentIntent, log } = await verifyStripePayment(
+          payment.stripePaymentIntentId
         );
 
-        if (!paymentIntent) {
-          return res.status(400).send({
-            error: "Payment not successful",
-          });
-        }
-        if (paymentIntent.status !== "succeeded") {
-          return res.status(400).send({
-            error: "Payment not successful",
-          });
-        }
-        // get the events to retrieve log
-        // format log into obj with properties
-        const events = await stripe.events.list({
-          limit: 50,
-        });
-        const piEvents = events.data.filter(
-          (e) => e.data.object.id === paymentIntent.id
-        );
-        const log = piEvents.map((e) => ({
-          id: e.id,
-          type: e.type,
-          created: new Date(e.created * 1000),
-          data: e.data.object,
-        }));
-
-        const paymentMethod = paymentIntent.payment_method;
-        const charge = paymentIntent.charges?.data?.[0] || null;
+        const method = paymentIntent.payment_method;
+        const charge = paymentIntent.charges?.data?.[0];
 
         updatedPayment = await PaymentModel.findOneAndUpdate(
           { reference },
           {
             status: "success",
             paidAt: new Date(paymentIntent.created * 1000),
-            channel: paymentMethod?.type || "card",
+            channel: method?.type || "card",
             currency: paymentIntent.currency.toUpperCase(),
             transactionDate: paymentIntent.created,
             log,
             fees: charge?.balance_transaction?.fee || 0,
-            cardType: paymentMethod?.card?.brand || "",
-            bank: paymentMethod?.card?.funding || "",
-            countryCode: paymentMethod.card.country,
+            cardType: method?.card?.brand,
+            bank: method?.card?.funding,
+            countryCode: method?.card?.country,
             gatewayResponse: charge?.outcome?.seller_message || "",
             gateway: "stripe",
           },
           { new: true }
-        );
+        ).lean();
+      } catch (err) {
+        return res.status(400).send({ error: err.message });
       }
     }
-    // convert itemAmount to naira
 
-    // 1000 naira = 10 points
-    // round down to the nearest 1000
-    const itemsTotalAmount = updatedPayment.itemsTotal;
-
-    const itemsTotalAmountInNairaAndKobo = await covertToNaira(
-      itemsTotalAmount,
+    // ------------------------------------------------------------
+    // POINTS, ORDER CREATION, EMAIL (unchanged)
+    // ------------------------------------------------------------
+    const itemsTotalAmountInKobo = await covertToNaira(
+      updatedPayment.itemsTotal,
       currency
     );
-
-    // convert all from kobo to naira
-    const itemsTotalAmountInNaira = itemsTotalAmountInNairaAndKobo / 100;
-
+    const itemsTotalAmountInNaira = itemsTotalAmountInKobo / 100;
     const pointToAdd = Math.floor(itemsTotalAmountInNaira / 1000) * 10;
 
     const existingOrder = await OrderModel.findOne({
       payment: updatedPayment._id,
     }).lean();
+
     if (existingOrder) {
       return res.status(200).send({
         message: "Payment verified successfully",
@@ -679,45 +627,47 @@ const verifyPayment = async (req, res) => {
       user: updatedPayment.user,
       gainedPoints: pointToAdd,
     });
+
     if (newOrder.error) {
       return res.status(400).send({ error: newOrder.error });
     }
+
     const order = newOrder.order;
-    const addPoints = await addPointAfterSales(updatedPayment.user, pointToAdd);
+
+    await addPointAfterSales(updatedPayment.user, pointToAdd);
     order.orderPoints = pointToAdd;
+
     const orderEmailTemplate = await EmailTemplateModel.findOne({
       name: "successful-order",
     }).lean();
-    const user = await UserModel.findOne({
-      _id: updatedPayment.user,
-    }).lean();
-    const email = user.email;
-    const formattedOrderTemplateBody = replaceOrderVariablesinTemplate(
+
+    const user = await UserModel.findById(updatedPayment.user).lean();
+
+    const emailBody = replaceOrderVariablesinTemplate(
       replaceUserVariablesinTemplate(orderEmailTemplate?.body, user),
       order
     );
-
-    const formattedOrderTemplateSubject = replaceOrderVariablesinTemplate(
+    const emailSubject = replaceOrderVariablesinTemplate(
       replaceUserVariablesinTemplate(orderEmailTemplate?.subject, user),
       order
     );
 
-    const param = {
+    await sendEmail({
       from: "admin@zeaper.com",
-      to: [email],
-      subject: formattedOrderTemplateSubject || "Welcome",
-      body: formattedOrderTemplateBody || "Welcome to Zeap",
+      to: [user.email],
+      subject: emailSubject,
+      body: emailBody,
       attach: true,
       order_id: order._id,
-    };
-    const orderMail = await sendEmail(param);
+    });
 
     return res.status(200).send({
       message: "Payment verified successfully",
       data: { payment: updatedPayment, order, addedPoints: pointToAdd },
     });
   } catch (error) {
-    res.status(400).send({ error: error.message });
+    console.error("Verify Payment Error:", error);
+    return res.status(500).send({ error: error.message });
   }
 };
 
