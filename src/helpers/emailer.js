@@ -58,10 +58,27 @@ const sendEmail = async (param) => {
     if (attach) {
       const website_url = `${url}/${order_id}`;
       console.log("website_url", website_url);
-      pdf = await generatePdf({
-        type: "url",
-        website_url,
-      });
+      const MIN_PDF_BYTES = 15000;
+      let attempts = 0;
+
+      while (attempts < 2) {
+        attempts += 1;
+        pdf = await generatePdf({
+          type: "url",
+          website_url,
+        });
+
+        if (pdf && pdf.length >= MIN_PDF_BYTES) {
+          break;
+        }
+
+        // Give the receipt page a moment and retry once for slow SPA renders.
+        await new Promise((resolve) => setTimeout(resolve, 4000));
+      }
+
+      if (!pdf || pdf.length < MIN_PDF_BYTES) {
+        throw new Error("Unable to generate a non-empty receipt PDF");
+      }
 
       const today = new Date();
       const pdfFilename = fileName
